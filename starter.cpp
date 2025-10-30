@@ -400,17 +400,231 @@ void write_network(const char* filename, network& BayesNet) {
     cout << "Network written to file: " << filename << endl;
 }
 
+// Function to initialize CPTs with uniform distributions
+void initialize_uniform_cpts(network& BayesNet) {
+    int N = BayesNet.netSize();
+    for (int i = 0; i < N; i++) {
+        auto node = BayesNet.get_nth_node(i);
+        vector<string> parents = node->get_Parents();
+        int num_values = node->get_nvalues();
+        
+        // Calculate total CPT size
+        int parent_combinations = 1;
+        for (const string& parent : parents) {
+            auto parent_node = BayesNet.search_node(parent);
+            parent_combinations *= parent_node->get_nvalues();
+        }
+        
+        int cpt_size = parent_combinations * num_values;
+        vector<float> uniform_cpt(cpt_size, 1.0f / num_values);
+        
+        node->set_CPT(uniform_cpt);
+    }
+}
 
+// Function to read training data
+vector<vector<string>> read_records(const char* filename) {
+    vector<vector<string>> records;
+    ifstream file(filename);
+    string line;
+    
+    while (getline(file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        
+        vector<string> record;
+        stringstream ss(line);
+        string value;
+        
+        while (getline(ss, value, ',')) {
+            // Remove quotes and trim
+            value = trim(value);
+            if (value.front() == '"') value = value.substr(1);
+            if (value.back() == '"') value = value.substr(0, value.length() - 1);
+            record.push_back(value);
+        }
+        records.push_back(record);
+    }
+    
+    file.close();
+    return records;
+}
 
+// Function to get node index from value
+int get_value_index(const vector<string>& values, const string& value) {
+    for (int i = 0; i < values.size(); i++) {
+        if (values[i] == value) return i;
+    }
+    return -1; // Not found
+}
 
-
+// EM Algorithm for learning with missing data
+void learn_parameters_em(network& BayesNet, vector<vector<string>>& records, int max_iterations = 10) {
+    int N = BayesNet.netSize();
+    double prev_likelihood = -1e9;
+    
+    for (int iter = 0; iter < max_iterations; iter++) {
+        cout << "EM Iteration " << iter + 1 << endl;
+        
+        // E-step: Compute expected counts
+        map<string, map<vector<string>, map<string, double>>> expected_counts;
+        
+        // Initialize counts
+        for (int i = 0; i < N; i++) {
+            auto node = BayesNet.get_nth_node(i);
+            string node_name = node->get_name();
+            vector<string> parents = node->get_Parents();
+            vector<string> values = node->get_values();
+            
+            expected_counts[node_name] = map<vector<string>, map<string, double>>();
+        }
+        
+        // Process each record
+        for (const auto& record : records) {
+            if (record.size() != N) continue;
+            
+            // For each node, update expected counts
+            for (int i = 0; i < N; i++) {
+                auto node = BayesNet.get_nth_node(i);
+                string node_name = node->get_name();
+                vector<string> parents = node->get_Parents();
+                vector<string> values = node->get_values();
+                
+                string node_value = record[i];
+                if (node_value == "?") {
+                    // Missing value - distribute according to current probabilities
+                    vector<string> parent_values;
+                    bool parents_available = true;
+                    
+                    for (const string& parent : parents) {
+                        int parent_idx = BayesNet.get_index(parent);
+                        if (parent_idx >= 0 && parent_idx < record.size() && record[parent_idx] != "?") {
+                            parent_values.push_back(record[parent_idx]);
+                        } else {
+                            parents_available = false;
+                            break;
+                        }
+                    }
+                    
+                    if (parents_available) {
+                        // Get current probabilities for this parent configuration
+                        vector<float> cpt = node->get_CPT();
+                        int parent_config_idx = 0;
+                        
+                        // Calculate parent configuration index
+                        int multiplier = 1;
+                        for (int p = parents.size() - 1; p >= 0; p--) {
+                            auto parent_node = BayesNet.search_node(parents[p]);
+                            int parent_val_idx = get_value_index(parent_node->get_values(), parent_values[p]);
+                            parent_config_idx += parent_val_idx * multiplier;
+                            multiplier *= parent_node->get_nvalues();
+                        }
+                        
+                        // Distribute probability among all possible values
+                        for (int v = 0; v < values.size(); v++) {
+                            int cpt_idx = parent_config_idx * values.size() + v;
+                            if (cpt_idx < cpt.size()) {
+                                expected_counts[node_name][parent_values][values[v]] += cpt[cpt_idx];
+                            }
+                        }
+                    }
+                } else {
+                    // Observed value - count as 1
+                    vector<string> parent_values;
+                    bool parents_available = true;
+                    
+                    for (const string& parent : parents) {
+                        int parent_idx = BayesNet.get_index(parent);
+                        if (parent_idx >= 0 && parent_idx < record.size() && record[parent_idx] != "?") {
+                            parent_values.push_back(record[parent_idx]);
+                        } else {
+                            parents_available = false;
+                            break;
+                        }
+                    }
+                    
+                    if (parents_available) {
+                        expected_counts[node_name][parent_values][node_value] += 1.0;
+                    }
+                }
+            }
+        }
+        
+        // M-step: Update parameters
+        for (int i = 0; i < N; i++) {
+            auto node = BayesNet.get_nth_node(i);
+            string node_name = node->get_name();
+            vector<string> parents = node->get_Parents();
+            vector<string> values = node->get_values();
+            
+            vector<float> new_cpt;
+            
+            // Calculate new probabilities from expected counts
+            auto& node_counts = expected_counts[node_name];
+            
+            for (const auto& parent_config : node_counts) {
+                const vector<string>& parent_vals = parent_config.first;
+                const map<string, double>& value_counts = parent_config.second;
+                
+                // Calculate total count for normalization
+                double total_count = 0.0;
+                for (const string& value : values) {
+                    auto it = value_counts.find(value);
+                    if (it != value_counts.end()) {
+                        total_count += it->second;
+                    }
+                }
+                
+                // Add small epsilon to avoid zero probabilities
+                double epsilon = 1e-6;
+                total_count += epsilon * values.size();
+                
+                // Calculate normalized probabilities
+                for (const string& value : values) {
+                    double count = epsilon; // Laplace smoothing
+                    auto it = value_counts.find(value);
+                    if (it != value_counts.end()) {
+                        count += it->second;
+                    }
+                    new_cpt.push_back(count / total_count);
+                }
+            }
+            
+            // If no data for some configurations, use uniform
+            if (new_cpt.empty()) {
+                int total_size = values.size();
+                for (const string& parent : parents) {
+                    auto parent_node = BayesNet.search_node(parent);
+                    total_size *= parent_node->get_nvalues();
+                }
+                new_cpt.resize(total_size, 1.0f / values.size());
+            }
+            
+            node->set_CPT(new_cpt);
+        }
+        
+        cout << "Iteration " << iter + 1 << " completed" << endl;
+    }
+}
 
 #ifndef BN_LIB
 int main() {
-    network BayesNet = read_network("solved.bif");
+    // Load the network structure
+    network BayesNet = read_network("hailfinder.bif");
+    cout << "Network loaded with " << BayesNet.netSize() << " nodes" << endl;
     
-    cout << "Network loaded successfully!" << endl;
-    cout << "Number of nodes: " << BayesNet.netSize() << endl;
+    // Initialize with uniform distributions
+    initialize_uniform_cpts(BayesNet);
+    cout << "CPTs initialized with uniform distributions" << endl;
+    
+    // Read training data
+    vector<vector<string>> records = read_records("records.dat");
+    cout << "Loaded " << records.size() << " training records" << endl;
+    
+    // Learn parameters using EM algorithm
+    learn_parameters_em(BayesNet, records);
+    
+    // Write the learned network
+    write_network("solved.bif", BayesNet);
     
     return 0;
 }
